@@ -1,3 +1,4 @@
+
 import os
 import sys 
 import math
@@ -27,6 +28,40 @@ from internal.viewer.ui import RenderPanel, TransformPanel, EditPanel
 
 DROPDOWN_USE_DIRECT_APPEARANCE_EMBEDDING_VALUE = "@Direct"
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Module-level helpers (PLY loading, octree index)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _sh_degree_from_ply(path: str) -> int:
+    """Auto-detect SH degree from PLY header by counting f_rest_ properties."""
+    from plyfile import PlyData
+    el = PlyData.read(path).elements[0]
+    n_rest = sum(1 for p in el.properties if p.name.startswith("f_rest_"))
+    if n_rest == 0:
+        return 0
+    for deg in range(1, 5):
+        if 3 * ((deg + 1) ** 2 - 1) == n_rest:
+            return deg
+    raise ValueError(f"Cannot determine SH degree from {n_rest} f_rest_ props in {path}")
+
+
+def _load_octree_idx(ply_path: str):
+    """Load .idx octree file alongside a .ply; return None if absent."""
+    idx_path = os.path.splitext(ply_path)[0] + ".idx"
+    if not os.path.exists(idx_path):
+        print(f"[viewer] No octree index found at {idx_path} — frustum culling disabled")
+        return None
+    data = np.load(idx_path)
+    octree = {
+        "node_aabbs":   data["node_aabbs"],
+        "node_offsets": data["node_offsets"],
+        "flat_indices": data["flat_indices"],
+    }
+    L = len(octree["node_aabbs"])
+    print(f"[viewer] Loaded octree index: {L:,} leaf nodes from {idx_path}")
+    return octree
+
 class Viewer:
     def __init__(
             self,
@@ -38,7 +73,7 @@ class Viewer:
             background_color: Tuple = (0.5, 0.5, 0.5),
             image_format: Literal["jpeg", "png"] = "jpeg",
             reorient: Literal["auto", "enable", "disable"] = "auto",
-            sh_degree: int = 3,
+            sh_degree: int = -1,
             enable_transform: bool = False,
             show_cameras: bool = False,
             cameras_json: str = None,
@@ -49,8 +84,16 @@ class Viewer:
             no_render_panel: bool = False,
             iterations: int=30000,
             crop_box_size: float=16.0,
-            from_direct_path: str = None, 
+            from_direct_path: str = None,
             is_training: bool = False,
+            # Frustum culling / index building
+            build_index: bool = False,
+            leaf_max: int = 5000,
+            no_culling: bool = False,
+            # PLY loading
+            fp16_load: bool = False,
+            # Profiling
+            no_profiling: bool = False,
     ):
         self.render_type_name = {
             "RGB": 'render', 
@@ -88,6 +131,11 @@ class Viewer:
         self.is_training = is_training
         self.show_edit_panel = ~no_edit_panel
         self.show_render_panel = ~no_render_panel
+        self.build_index  = build_index
+        self.leaf_max     = leaf_max
+        self.no_culling   = no_culling
+        self.fp16_load    = fp16_load
+        self.no_profiling = no_profiling
 
         # init model & scene 
         self._init_models(iterations)
@@ -95,19 +143,154 @@ class Viewer:
         self._init_camera_poses(self.cameras_json)
         self.clients = {}
         
+    def _load_ply(self, model, path: str):
+        """Load a (possibly compressed) 2DGS .ply into model with NaN sanitization."""
+        from plyfile import PlyData
+        FP16_MAX = 65504.0
+
+        print(f"[viewer] Loading PLY: {path}")
+        el = PlyData.read(path).elements[0]
+
+        def _sorted_names(prefix):
+            names = [p.name for p in el.properties if p.name.startswith(prefix)]
+            return sorted(names, key=lambda x: int(x.split("_")[-1]))
+
+        def _stack(names):
+            return np.stack([np.asarray(el[n]) for n in names], axis=1).astype(np.float32)
+
+        def _safe(arr, label=""):
+            n_bad = int(np.sum(~np.isfinite(arr)))
+            if n_bad > 0:
+                print(f"[viewer]   {label}: zeroing {n_bad:,} NaN/Inf values")
+                arr = np.where(np.isfinite(arr), arr, 0.0)
+            if np.abs(arr).max() > FP16_MAX:
+                thr = float(min(np.percentile(np.abs(arr), 99.9), FP16_MAX))
+                n_c = int(np.sum(np.abs(arr) > thr))
+                print(f"[viewer]   {label}: clipping {n_c:,} overflow values to ±{thr:.1f}")
+                arr = np.clip(arr, -thr, thr)
+            return arr
+
+        xyz       = _safe(_stack(["x", "y", "z"]),                                  "xyz")
+        opacities = _safe(np.asarray(el["opacity"], dtype=np.float32)[..., None],   "opacity")
+        scales    = _safe(_stack(_sorted_names("scale_")),                           "scale")
+        rotations = _safe(_stack(_sorted_names("rot_")),                             "rotation")
+
+        # DC colour: PLY [N,3] → tensor [N,1,3]
+        features_dc = _safe(_stack(_sorted_names("f_dc_")), "f_dc")[:, np.newaxis, :]
+
+        # SH rest: PLY [N,3*K] — all-R then all-G then all-B
+        #  → reshape [N,3,K] → transpose [N,K,3]
+        f_rest_names = _sorted_names("f_rest_")
+        if f_rest_names:
+            f_rest_flat   = _safe(_stack(f_rest_names), "f_rest")   # [N, 3*K]
+            n_coeffs      = f_rest_flat.shape[1]
+            file_sh       = 0
+            for deg in range(1, 5):
+                if 3 * ((deg + 1) ** 2 - 1) == n_coeffs:
+                    file_sh = deg
+                    break
+            K             = (file_sh + 1) ** 2 - 1
+            features_rest = f_rest_flat.reshape((-1, 3, K)).transpose(0, 2, 1)   # [N,K,3]
+            print(f"[viewer]   SH degree: {file_sh} "
+                  f"({n_coeffs} f_rest_ props → [{f_rest_flat.shape[0]}, {K}, 3])")
+        else:
+            features_rest = np.zeros((xyz.shape[0], 0, 3), dtype=np.float32)
+            file_sh       = 0
+            print("[viewer]   No f_rest_ — degree-0 (view-independent colour)")
+
+        if self.fp16_load:
+            print("[viewer]   --fp16-load: fp16 PCIe transfer active")
+
+        def _cuda(arr):
+            t = torch.from_numpy(arr.astype(np.float32))
+            if self.fp16_load:
+                t = t.half()
+            return t.cuda().float()
+
+        model._xyz           = _cuda(xyz)
+        model._opacity       = _cuda(opacities)
+        model._features_dc   = _cuda(features_dc)
+        model._features_rest = _cuda(features_rest)
+        model._scaling       = _cuda(scales)
+        model._rotation      = _cuda(rotations)
+
+        if hasattr(model, "active_sh_degree"):
+            model.active_sh_degree = file_sh
+        if hasattr(model, "max_sh_degree"):
+            model.max_sh_degree = min(model.max_sh_degree, file_sh)
+
+        vram_mb = sum(
+            t.element_size() * t.nelement()
+            for t in [model._xyz, model._opacity, model._features_dc,
+                      model._features_rest, model._scaling, model._rotation]
+        ) / 1024 / 1024
+        print(f"[viewer]   Loaded {xyz.shape[0]:,} splats — {vram_mb:.0f} MB VRAM")
+
+    def _build_octree_index(self, ply_path: str) -> dict:
+        """Build octree index for *ply_path*, save alongside as .idx, return dict."""
+        import time as _time
+        from build_index import build_octree, read_xyz
+
+        idx_path = os.path.splitext(ply_path)[0] + ".idx"
+        print(f"[viewer] Building octree index (leaf_max={self.leaf_max:,}) ...")
+        t0  = _time.perf_counter()
+        xyz = read_xyz(ply_path)
+        node_aabbs, node_offsets, flat_indices = build_octree(xyz, leaf_max=self.leaf_max)
+        dt  = _time.perf_counter() - t0
+        L   = len(node_aabbs)
+        print(f"[viewer]   {L:,} leaf nodes in {dt:.1f}s — saving to {idx_path}")
+        with open(idx_path, "wb") as fh:
+            np.savez_compressed(fh,
+                                node_aabbs=node_aabbs,
+                                node_offsets=node_offsets,
+                                flat_indices=flat_indices)
+        sz = os.path.getsize(idx_path) / 1024 / 1024
+        print(f"[viewer]   Index saved ({sz:.1f} MB)")
+        return {"node_aabbs": node_aabbs,
+                "node_offsets": node_offsets,
+                "flat_indices": flat_indices}
+
     def _init_models(self, iterations):
-        # init gaussian model & renderer
-        self.gaussian_model = GaussianModel(sh_degree=self.sh_degree)
         if not self.is_training:
             self.iteration = iterations
-            self.ply_path = os.path.join(self.model_paths, "point_cloud", f"iteration_{iterations}", "point_cloud.ply") if not self.model_paths.lower().endswith('.ply') else self.model_paths
+            self.ply_path = (
+                os.path.join(self.model_paths, "point_cloud",
+                             f"iteration_{iterations}", "point_cloud.ply")
+                if not self.model_paths.lower().endswith('.ply')
+                else self.model_paths
+            )
             if not os.path.exists(self.ply_path):
                 print(f'[Alert] there is no pointcloud in: {self.ply_path}')
                 raise FileNotFoundError
-            print(f'[INFO] ply path loaded from: {self.ply_path}')
-            self.gaussian_model.load_ply(self.ply_path)
+            print(f'[INFO] ply path: {self.ply_path}')
+
+            if self.sh_degree >= 0:
+                sh = self.sh_degree
+                print(f"[viewer] SH degree: {sh} (from --sh_degree flag)")
+            else:
+                sh = _sh_degree_from_ply(self.ply_path)
+                print(f"[viewer] SH degree: {sh} (auto-detected from PLY header)")
+
+            self.gaussian_model = GaussianModel(sh_degree=sh)
+            self._load_ply(self.gaussian_model, self.ply_path)
             print(f'[INFO] number of points: {self.gaussian_model._xyz.shape[0]}')
-        self.viewer_renderer = ViewerRenderer(self.gaussian_model, self.background_color, not self.is_training)
+
+            if self.build_index:
+                octree = self._build_octree_index(self.ply_path)
+            else:
+                octree = _load_octree_idx(self.ply_path)
+        else:
+            self.gaussian_model = GaussianModel(sh_degree=max(self.sh_degree, 0))
+            octree = None
+
+        self.viewer_renderer = ViewerRenderer(
+            self.gaussian_model,
+            self.background_color,
+            not self.is_training,
+            octree=octree,
+            culling_enabled=not self.no_culling,
+            profiling_enabled=not self.no_profiling,
+        )
 
     def _init_scene_camera_transform(self, cameras_json_path, mode, up):
         transform = torch.eye(4, dtype=torch.float)
@@ -149,7 +332,12 @@ class Viewer:
         self.gaussian_model._rotation = new_gaussians._rotation.clone().detach()
         self.gaussian_model._features_dc = new_gaussians._features_dc.clone().detach()
         self.gaussian_model._features_rest = new_gaussians._features_rest.clone().detach()
-        self.viewer_renderer = ViewerRenderer(self.gaussian_model, self.background_color, self.is_training)
+        self.viewer_renderer = ViewerRenderer(
+            self.gaussian_model,
+            self.background_color,
+            self.is_training,
+            profiling_enabled=not self.no_profiling,
+        )
 
     def get_gpu_memory_usage(self):
         total_memory = torch.cuda.memory_allocated() + torch.cuda.memory_reserved() 
@@ -513,7 +701,8 @@ if __name__ == "__main__":
     parser.add_argument("--reorient", "-r", type=str, default="auto",
                         help="whether reorient the scene, available values: auto, enable, disable")
     parser.add_argument("--sh_degree", "--sh-degree", "--sh",
-                        type=int, default=3)
+                        type=int, default=-1,
+                        help="SH degree to use (-1 = auto-detect from PLY header)")
     parser.add_argument("--enable_transform", "--enable-transform",
                         action="store_true", default=False,
                         help="Enable transform options on Web UI. May consume more memory")
@@ -526,6 +715,22 @@ if __name__ == "__main__":
 
     parser.add_argument("--no_edit_panel", action="store_true", default=False)
     parser.add_argument("--no_render_panel", action="store_true", default=False)
+
+    parser.add_argument("--build-index", "--build_index",
+                        action="store_true", default=False,
+                        help="Build (or rebuild) the octree frustum-culling index for the PLY")
+    parser.add_argument("--leaf-max", "--leaf_max",
+                        type=int, default=5000,
+                        help="Max splats per octree leaf node when building index (default 5000)")
+    parser.add_argument("--no-culling", "--no_culling",
+                        action="store_true", default=False,
+                        help="Disable frustum culling even when an octree index exists")
+    parser.add_argument("--no-profiling", "--no_profiling",
+                        action="store_true", default=False,
+                        help="Disable per-frame GPU timing output")
+    parser.add_argument("--fp16-load", "--fp16_load",
+                        action="store_true", default=False,
+                        help="Transfer tensors via fp16 during PLY load (halves PCIe bandwidth)")
 
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--crop_box_size", type=float, default=16.0)

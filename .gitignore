@@ -12,3 +12,4 @@ assets
 *.out
 *.npz
 **/tmp
+*.md
