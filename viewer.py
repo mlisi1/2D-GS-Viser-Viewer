@@ -503,7 +503,7 @@ class Viewer:
                     min=128,
                     max=1920,
                     step=128,
-                    initial_value=1024,
+                    initial_value=1920,
                 )
                 self.jpeg_quality_when_static = server.add_gui_slider(
                     "JPEG Quality",
@@ -519,7 +519,7 @@ class Viewer:
                     min=0,
                     max=100,
                     step=1,
-                    initial_value=60,
+                    initial_value=100,
                 )
 
             with server.add_gui_folder("Render Options"):
@@ -581,6 +581,13 @@ class Viewer:
                     step=1,
                     initial_value=1,
                 )
+                self.opacity_threshold_slider = server.add_gui_slider(
+                    "Opacity Threshold",
+                    min=0.0,
+                    max=0.5,
+                    step=0.01,
+                    initial_value=0.05,
+                )
                 
                 if self.viewer_renderer.gaussian_model.max_sh_degree > 0:
                     self.active_sh_degree_slider = server.add_gui_slider(
@@ -633,6 +640,7 @@ class Viewer:
             @self.depth_ratio_slider.on_update
             @self.scale_slider.on_update
             @self.sparsity_slider.on_update
+            @self.opacity_threshold_slider.on_update
             @self.enable_ptc.on_update
             @self.surfel_mode.on_click
             @self.point_size.on_update

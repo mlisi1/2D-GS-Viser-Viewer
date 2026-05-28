@@ -80,8 +80,9 @@ class ViewerRenderer:
         self.clm_colors       = torch.tensor(plt.cm.get_cmap("turbo").colors, device="cuda")
 
         # Frustum-culling state
-        self.octree          = octree
-        self.culling_enabled = culling_enabled
+        self.octree             = octree
+        self.culling_enabled    = culling_enabled
+        self._spatially_ordered = False
 
         # Profiling state
         self.profiling_enabled     = profiling_enabled
@@ -123,6 +124,29 @@ class ViewerRenderer:
         self.rotations = self.gaussian_model.get_rotation
         self.shs       = self.gaussian_model.get_features
 
+        if self.octree is not None and not self._spatially_ordered:
+            # Reorder all splat tensors to match octree flat_indices leaf order.
+            # After this, leaf j maps to contiguous indices [node_offsets[j], node_offsets[j+1]),
+            # enabling direct slice gather instead of scattered bool-mask gather.
+            # Done one attribute at a time so peak VRAM stays at 2× per-attribute, not 2× total.
+            perm = torch.from_numpy(
+                self.octree["flat_indices"].astype(np.int64)
+            ).to(self.means3D.device)
+            for attr in ('_xyz', '_opacity', '_scaling', '_rotation',
+                         '_features_dc', '_features_rest'):
+                old = getattr(self.gaussian_model, attr)
+                setattr(self.gaussian_model, attr, old[perm].contiguous())
+                del old
+            del perm
+            self._spatially_ordered = True
+            self.means3D   = self.gaussian_model.get_xyz
+            self.means2D   = torch.zeros_like(self.means3D)
+            self.opacity   = self.gaussian_model.get_opacity
+            self.scales    = self.gaussian_model.get_scaling
+            self.rotations = self.gaussian_model.get_rotation
+            self.shs       = self.gaussian_model.get_features
+            print(f"[viewer] Spatial reorder : {self.means3D.shape[0]:,} splats sorted by octree leaf")
+
     def disk_kernel(self, opacity):
         return torch.exp(-0.5 * 100 * torch.clamp(opacity - 0.5, min=0) ** 2)
 
@@ -138,18 +162,23 @@ class ViewerRenderer:
 
     def _apply_frustum_cull(self,
                              is_in_box: torch.Tensor,
-                             viewpoint_camera) -> torch.Tensor:
+                             viewpoint_camera):
         """
         Narrow *is_in_box* to splats whose octree leaf intersects the view frustum.
 
+        Returns (bool_mask, vis_ranges) where vis_ranges is a list of (start, end)
+        integer pairs when splats are spatially ordered and no crop box is active.
+        vis_ranges enables a fast contiguous-slice gather in render_viewer(); it is
+        None whenever a fallback bool-mask gather is required (crop box active, or
+        model not yet spatially reordered).
+
         Uses 5 planes (left / right / top / bottom / near).  The far plane is
         deliberately omitted: the GS rasterizer does not hard-clip at zfar, so
-        aerial scenes with objects kilometres away would be incorrectly culled by
-        the projection matrix's zfar = 100 m.
+        scenes with objects far away would be incorrectly culled by the projection
+        matrix's zfar = 100 m.
 
         Matrix convention: p_clip = p_world @ full_proj_transform  (row-vector).
         Planes are extracted from the columns of M (Gribb-Hartmann method).
-        Each AABB is expanded by one node-width as a velocity prefetch margin.
         """
         M        = viewpoint_camera.full_proj_transform.detach().cpu().numpy()  # [4,4]
         planes   = np.stack([
@@ -165,15 +194,9 @@ class ViewerRenderer:
 
         node_aabbs   = self.octree["node_aabbs"]    # float32 [L, 6]
         node_offsets = self.octree["node_offsets"]  # int64   [L+1]
-        flat_indices = self.octree["flat_indices"]  # int32   [N]
 
         aabb_min = node_aabbs[:, :3]   # [L, 3]
         aabb_max = node_aabbs[:, 3:]   # [L, 3]
-
-        # Expand by 1 node-width (velocity prefetch margin).
-        w        = (aabb_max - aabb_min).max(axis=1, keepdims=True)
-        aabb_min = aabb_min - w
-        aabb_max = aabb_max + w
 
         # Gribb-Hartmann p-vertex test, vectorised over all L nodes.
         pos_mask = normals[:, np.newaxis, :] >= 0
@@ -181,17 +204,30 @@ class ViewerRenderer:
         dots     = (p_vert * normals[:, np.newaxis, :]).sum(axis=2) + d_vals[:, np.newaxis]
         node_vis = (dots >= 0).all(axis=0)   # [L]
 
-        # Build CPU bool mask → one GPU transfer.
         N_total       = is_in_box.shape[0]
         vis_cpu       = np.zeros(N_total, dtype=np.bool_)
         visible_nodes = np.where(node_vis)[0]
-        if len(visible_nodes) > 0:
-            starts  = node_offsets[visible_nodes]
-            ends    = node_offsets[visible_nodes + 1]
-            all_idx = np.concatenate([flat_indices[s:e] for s, e in zip(starts, ends)])
-            vis_cpu[all_idx] = True
+        vis_ranges    = None
 
-        return is_in_box & torch.from_numpy(vis_cpu).to(is_in_box.device)
+        if len(visible_nodes) > 0:
+            starts = node_offsets[visible_nodes]
+            ends   = node_offsets[visible_nodes + 1]
+
+            if self._spatially_ordered:
+                # Leaf j → contiguous [node_offsets[j], node_offsets[j+1]): use
+                # direct slice assignment (numpy memset, faster than flat_indices scatter).
+                for s, e in zip(starts, ends):
+                    vis_cpu[s:e] = True
+                # Expose ranges for contiguous GPU gather only when no crop box is active.
+                if is_in_box is self.all_ids:
+                    vis_ranges = list(zip(starts.tolist(), ends.tolist()))
+            else:
+                flat_indices = self.octree["flat_indices"]
+                all_idx = np.concatenate([flat_indices[s:e] for s, e in zip(starts, ends)])
+                vis_cpu[all_idx] = True
+
+        bool_mask = is_in_box & torch.from_numpy(vis_cpu).to(is_in_box.device)
+        return bool_mask, vis_ranges
 
     # ── profiling ─────────────────────────────────────────────────────────────
 
@@ -234,6 +270,7 @@ class ViewerRenderer:
                       depth_ratio,
                       bg_color: torch.Tensor,
                       sparsity: int = 1,
+                      opacity_threshold: float = 0.0,
                       show_ptc: bool = False,
                       show_disk: bool = False,
                       point_size: float = 0.001,
@@ -276,23 +313,35 @@ class ViewerRenderer:
             is_in_box = self.all_ids
 
         # ── frustum culling (CPU octree walk + GPU mask) ──────────────────────
+        vis_ranges = None
         if self.culling_enabled and self.octree is not None:
-            is_in_box = self._apply_frustum_cull(is_in_box, viewpoint_camera)
+            is_in_box, vis_ranges = self._apply_frustum_cull(is_in_box, viewpoint_camera)
+
+        # ── opacity threshold (GPU, removes near-transparent splats) ──────────
+        if opacity_threshold > 0.0:
+            is_in_box = is_in_box & (self.opacity[:, 0] > opacity_threshold)
+            vis_ranges = None  # ranges no longer safe with per-splat opacity filter
 
         # ── gather visible splats ─────────────────────────────────────────────
-        means3D_f = self.means3D[is_in_box][::sparsity]
-        means2D_f = self.means2D[is_in_box][::sparsity]
-        opacity_f = self.opacity[is_in_box][::sparsity]
+        # Fast path (spatially ordered, no crop box, no opacity threshold):
+        # contiguous slice-cat per leaf — avoids scattered bool-mask gather.
+        if vis_ranges:
+            _cat = lambda t: torch.cat([t[s:e:sparsity] for s, e in vis_ranges])
+        else:
+            _cat = lambda t: t[is_in_box][::sparsity]
+
+        means3D_f = _cat(self.means3D)
+        means2D_f = _cat(self.means2D)
+        opacity_f = _cat(self.opacity)
         if show_disk:
             opacity_f = self.disk_kernel(opacity_f)
-        scales_f = (
-            torch.full(self.scales[is_in_box][::sparsity].shape,
-                       point_size * 0.1, device=self.scales.device)
-            if show_ptc
-            else scaling_modifier * self.scales[is_in_box][::sparsity]
-        )
-        rot_f   = self.rotations[is_in_box][::sparsity]
-        shs_f   = self.shs[is_in_box][::sparsity]
+        scales_f = _cat(self.scales)
+        if show_ptc:
+            scales_f = torch.full(scales_f.shape, point_size * 0.1, device=scales_f.device)
+        else:
+            scales_f = scaling_modifier * scales_f
+        rot_f = _cat(self.rotations)
+        shs_f = _cat(self.shs)
 
         # ── [A] SH evaluation ─────────────────────────────────────────────────
         # SH is always pre-computed here (not inside the rasterizer) so we can
@@ -359,20 +408,22 @@ class ViewerRenderer:
 
         if self.profiling_enabled:
             timer_post.__exit__(None, None, None)
-            n_vis = int(is_in_box.sum()) // sparsity
+            n_vis = (sum(e - s for s, e in vis_ranges) if vis_ranges
+                     else int(is_in_box.sum())) // sparsity
             self._record_profile(n_vis, timer_sh.ms, timer_raster.ms, timer_post.ms)
 
         if not compute_post:
             return {"render": rendered_image}
 
         return {
-            "render":      rendered_image,
-            "rend_alpha":  self.color_map(render_alpha.unsqueeze(-1)),
-            "rend_normal": render_normal,
-            "view_normal": view_normal,
-            "surf_depth":  self.color_map(surf_depth.unsqueeze(-1)),
-            "surf_normal": surf_normal,
-            "rend_dist":   self.color_map(render_dist.unsqueeze(-1)),
+            "render":          rendered_image,
+            "rend_alpha":      self.color_map(render_alpha.unsqueeze(-1)),
+            "rend_normal":     render_normal,
+            "view_normal":     view_normal,
+            "surf_depth":      self.color_map(surf_depth.unsqueeze(-1)),
+            "surf_depth_raw":  surf_depth.squeeze(0),   # float32 [H, W] in scene units
+            "surf_normal":     surf_normal,
+            "rend_dist":       self.color_map(render_dist.unsqueeze(-1)),
         }
 
     # ── output routing ────────────────────────────────────────────────────────
@@ -391,6 +442,7 @@ class ViewerRenderer:
                     active_sh_degree: int = 3,
                     scaling_modifier: float = 1.,
                     sparsity: int = 1,
+                    opacity_threshold: float = 0.0,
                     depth_ratio: float = 0.,
                     render_type: str = "render",
                     render_type1: str = "render",
@@ -413,7 +465,8 @@ class ViewerRenderer:
         results = self.render_viewer(
             camera, active_sh_degree, scaling_modifier, depth_ratio,
             self.background_color,
-            sparsity=sparsity, valid_range=valid_range,
+            sparsity=sparsity, opacity_threshold=opacity_threshold,
+            valid_range=valid_range,
             show_ptc=show_ptc, show_disk=show_disk, point_size=point_size,
             compute_post=compute_post,
         )

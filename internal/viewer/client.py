@@ -147,6 +147,7 @@ class ClientThread(threading.Thread):
             active_sh_degree = self.viewer.active_sh_degree_slider.value if hasattr(self.viewer, 'active_sh_degree_slider') else 0,
             scaling_modifier = self.viewer.scale_slider.value,
             sparsity = self.viewer.sparsity_slider.value,
+            opacity_threshold = self.viewer.opacity_threshold_slider.value,
             depth_ratio = self.viewer.depth_ratio_slider.value,
             render_type = self.viewer.render_type_name[self.viewer.render_type.value],
             render_type1 = self.viewer.render_type_name[self.viewer.render_type1.value],
