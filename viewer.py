@@ -94,6 +94,8 @@ class Viewer:
             fp16_load: bool = False,
             # Profiling
             no_profiling: bool = False,
+            # Display
+            local_display: bool = False,
     ):
         self.render_type_name = {
             "RGB": 'render', 
@@ -131,11 +133,14 @@ class Viewer:
         self.is_training = is_training
         self.show_edit_panel = ~no_edit_panel
         self.show_render_panel = ~no_render_panel
-        self.build_index  = build_index
-        self.leaf_max     = leaf_max
-        self.no_culling   = no_culling
-        self.fp16_load    = fp16_load
-        self.no_profiling = no_profiling
+        self.build_index    = build_index
+        self.leaf_max       = leaf_max
+        self.no_culling     = no_culling
+        self.fp16_load      = fp16_load
+        self.no_profiling   = no_profiling
+        self.local_display  = local_display
+        self._display_frame = None          # latest BGR frame for the native window
+        self._display_lock  = threading.Lock()
 
         # init model & scene 
         self._init_models(iterations)
@@ -434,9 +439,49 @@ class Viewer:
         server.on_client_connect(self._handle_new_client)
         server.on_client_disconnect(self._handle_client_disconnect)
         if block is True:
-            while True:
-                time.sleep(999)
+            if self.local_display:
+                self._run_display_loop()
+            else:
+                while True:
+                    time.sleep(999)
     
+    def _run_display_loop(self):
+        """Main-thread OpenCV display loop used with --local-display.
+
+        Renders are produced by the client thread(s) and dropped into
+        self._display_frame (BGR uint8).  This loop just blits the latest
+        frame to a native window — no JPEG, no WebSocket.
+
+        Camera control still comes from a browser client (connect to
+        http://localhost:<port> to navigate the scene).  The browser shows
+        the scene overlay; the rendered Gaussian splats appear here.
+        """
+        import cv2
+        win = "2DGS Viewer"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, 1280, 720)
+        print(f"[viewer] Local display window open  (ESC or close window to quit)")
+        print(f"[viewer] Navigate the scene in your browser at http://localhost:{self.port}")
+
+        while True:
+            with self._display_lock:
+                frame = self._display_frame
+
+            if frame is not None:
+                cv2.imshow(win, frame)
+                cv2.setWindowTitle(win, f"2DGS Viewer  {self.fps.value}")
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC
+                break
+            try:
+                if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+
+        cv2.destroyAllWindows()
+
     def _setup_titles(self, server):
         buttons = (
             TitlebarButton(
@@ -739,6 +784,13 @@ if __name__ == "__main__":
     parser.add_argument("--fp16-load", "--fp16_load",
                         action="store_true", default=False,
                         help="Transfer tensors via fp16 during PLY load (halves PCIe bandwidth)")
+    parser.add_argument("--local-display", "--local_display",
+                        action="store_true", default=False,
+                        help="Display frames in a native OpenCV window (no JPEG/WebSocket). "
+                             "Use browser only for camera navigation and GUI sliders.")
+    parser.add_argument("--local-viewer", "--local_viewer",
+                        action="store_true", default=False,
+                        help="Run the native Qt single-window viewer instead of the web viewer.")
 
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--crop_box_size", type=float, default=16.0)
@@ -762,7 +814,17 @@ if __name__ == "__main__":
     else:
         args.background_color = tuple([float(i) for i in args.background_color])
 
-    # create viewer
-    viewer_init_args = {key: getattr(args, key) for key in vars(args)}
-    viewer = Viewer(args, **viewer_init_args)
-    viewer.start()
+    # --local-viewer: launch native Qt GUI instead of the web viewer
+    if args.local_viewer:
+        from local_viewer import run_local_viewer
+        model_path = args.model_paths[0]
+        if model_path.lower().endswith('.ply'):
+            ply_path = model_path
+        else:
+            ply_path = os.path.join(model_path, "point_cloud",
+                                    f"iteration_{args.iterations}", "point_cloud.ply")
+        run_local_viewer(ply_path, args)
+    else:
+        viewer_init_args = {key: getattr(args, key) for key in vars(args)}
+        viewer = Viewer(args, **viewer_init_args)
+        viewer.start()

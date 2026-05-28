@@ -91,6 +91,9 @@ class ViewerRenderer:
         self._prof_frame_count     = 0
         self._prof_history: dict   = collections.defaultdict(list)
 
+        # Exposed after each render_viewer() call
+        self.last_visible_count    = 0
+
         if do_initialize:
             self.update_pc_features()
 
@@ -408,8 +411,12 @@ class ViewerRenderer:
 
         if self.profiling_enabled:
             timer_post.__exit__(None, None, None)
-            n_vis = (sum(e - s for s, e in vis_ranges) if vis_ranges
-                     else int(is_in_box.sum())) // sparsity
+
+        n_vis = (sum(e - s for s, e in vis_ranges) if vis_ranges
+                 else int(is_in_box.sum())) // sparsity
+        self.last_visible_count = n_vis
+
+        if self.profiling_enabled:
             self._record_profile(n_vis, timer_sh.ms, timer_raster.ms, timer_post.ms)
 
         if not compute_post:

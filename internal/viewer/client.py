@@ -57,10 +57,13 @@ class ClientThread(threading.Thread):
     # ── encode/send thread ────────────────────────────────────────────────────
 
     def _send_loop(self):
-        """Picks up the latest rendered frame and encodes+sends it.
+        """Picks up the latest rendered frame and delivers it.
 
-        Runs concurrently with the render loop so JPEG encoding does not stall
-        GPU work.  Frames are dropped (overwritten) if the encoder falls behind.
+        In normal mode: JPEG-encodes and sends via WebSocket.
+        In --local-display mode: drops raw BGR frame into viewer._display_frame
+        for the native OpenCV window — no encoding, no WebSocket.
+
+        Frames are dropped (overwritten) if delivery falls behind.
         """
         while True:
             self._send_ready.wait()
@@ -73,11 +76,16 @@ class ClientThread(threading.Thread):
             if slot is None:
                 continue
             image_np, jpeg_quality = slot
-            self.client.set_background_image(
-                image_np,
-                format=self.viewer.image_format,
-                jpeg_quality=jpeg_quality,
-            )
+            if self.viewer.local_display:
+                # Direct native display — no JPEG, no WebSocket.
+                with self.viewer._display_lock:
+                    self.viewer._display_frame = image_np[:, :, ::-1].copy()  # RGB→BGR
+            else:
+                self.client.set_background_image(
+                    image_np,
+                    format=self.viewer.image_format,
+                    jpeg_quality=jpeg_quality,
+                )
 
     # ── camera helpers ────────────────────────────────────────────────────────
 
@@ -210,11 +218,15 @@ class ClientThread(threading.Thread):
                     self.viewer.render_panel.preview_frame_slider.value = framenum
                     image_np = self.render_image_from_paths(camera_paths[framenum], camera_params)
                     framenum += 1
-                    self.client.set_background_image(
-                        image_np,
-                        format=self.viewer.image_format,
-                        jpeg_quality=jpeg_quality,
-                    )
+                    if self.viewer.local_display:
+                        with self.viewer._display_lock:
+                            self.viewer._display_frame = image_np[:, :, ::-1].copy()
+                    else:
+                        self.client.set_background_image(
+                            image_np,
+                            format=self.viewer.image_format,
+                            jpeg_quality=jpeg_quality,
+                        )
                     self.render_trigger.set()
                     end = time.time()
                     self.viewer.fps.value = f'{(1 / (end-start)):.1f} frame/sec'
