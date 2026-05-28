@@ -17,9 +17,13 @@ SH_C0 = 0.28209479177387814  # zeroth-order SH basis constant
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+_SOBEL_X = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).float().unsqueeze(0).unsqueeze(0) / 4
+_SOBEL_Y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).float().unsqueeze(0).unsqueeze(0) / 4
+
+
 def gradient_map(image):
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).float().unsqueeze(0).unsqueeze(0).cuda() / 4
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).float().unsqueeze(0).unsqueeze(0).cuda() / 4
+    sobel_x = _SOBEL_X.to(image.device)
+    sobel_y = _SOBEL_Y.to(image.device)
     grad_x = torch.cat([F.conv2d(image[i].unsqueeze(0), sobel_x, padding=1) for i in range(image.shape[0])])
     grad_y = torch.cat([F.conv2d(image[i].unsqueeze(0), sobel_y, padding=1) for i in range(image.shape[0])])
     return torch.sqrt(grad_x ** 2 + grad_y ** 2).norm(dim=0, keepdim=True)
@@ -113,11 +117,7 @@ class ViewerRenderer:
         self.means3D   = self.gaussian_model.get_xyz
         self.all_ids   = torch.ones(self.means3D.shape[0], dtype=torch.bool,
                                     device=self.means3D.device)
-        self.means2D   = torch.zeros_like(self.means3D, requires_grad=True) + 0
-        try:
-            self.means2D.retain_grad()
-        except Exception:
-            pass
+        self.means2D   = torch.zeros_like(self.means3D)
         self.opacity   = self.gaussian_model.get_opacity
         self.scales    = self.gaussian_model.get_scaling
         self.rotations = self.gaussian_model.get_rotation
@@ -182,11 +182,14 @@ class ViewerRenderer:
         node_vis = (dots >= 0).all(axis=0)   # [L]
 
         # Build CPU bool mask → one GPU transfer.
-        N_total  = is_in_box.shape[0]
-        vis_cpu  = np.zeros(N_total, dtype=np.bool_)
-        for i in np.where(node_vis)[0]:
-            s, e = int(node_offsets[i]), int(node_offsets[i + 1])
-            vis_cpu[flat_indices[s:e]] = True
+        N_total       = is_in_box.shape[0]
+        vis_cpu       = np.zeros(N_total, dtype=np.bool_)
+        visible_nodes = np.where(node_vis)[0]
+        if len(visible_nodes) > 0:
+            starts  = node_offsets[visible_nodes]
+            ends    = node_offsets[visible_nodes + 1]
+            all_idx = np.concatenate([flat_indices[s:e] for s, e in zip(starts, ends)])
+            vis_cpu[all_idx] = True
 
         return is_in_box & torch.from_numpy(vis_cpu).to(is_in_box.device)
 
@@ -234,7 +237,8 @@ class ViewerRenderer:
                       show_ptc: bool = False,
                       show_disk: bool = False,
                       point_size: float = 0.001,
-                      valid_range=None):
+                      valid_range=None,
+                      compute_post: bool = True):
         """
         Render the scene.  bg_color must be on GPU.
 
@@ -336,26 +340,30 @@ class ViewerRenderer:
             timer_post = _CudaTimer()
             timer_post.__enter__()
 
-        render_alpha          = allmap[1:2]
-        render_normal         = allmap[2:5]
-        render_normal         = (
-            render_normal.permute(1, 2, 0) @
-            viewpoint_camera.world_view_transform[:3, :3].T
-        ).permute(2, 0, 1)
-        render_depth_median   = torch.nan_to_num(allmap[5:6], 0, 0)
-        render_depth_expected = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
-        render_dist           = allmap[6:7]
-        surf_depth  = render_depth_expected * (1 - depth_ratio) + depth_ratio * render_depth_median
-        surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-        surf_normal = surf_normal.permute(2, 0, 1) * render_alpha.detach()
-        render_normal = F.normalize(render_normal, dim=0) * 0.5 + 0.5
-        surf_normal   = surf_normal * 0.5 + 0.5
-        view_normal   = -F.normalize(allmap[2:5], dim=0) * 0.5 + 0.5
+        if compute_post:
+            render_alpha          = allmap[1:2]
+            render_normal         = allmap[2:5]
+            render_normal         = (
+                render_normal.permute(1, 2, 0) @
+                viewpoint_camera.world_view_transform[:3, :3].T
+            ).permute(2, 0, 1)
+            render_depth_median   = torch.nan_to_num(allmap[5:6], 0, 0)
+            render_depth_expected = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
+            render_dist           = allmap[6:7]
+            surf_depth  = render_depth_expected * (1 - depth_ratio) + depth_ratio * render_depth_median
+            surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
+            surf_normal = surf_normal.permute(2, 0, 1) * render_alpha.detach()
+            render_normal = F.normalize(render_normal, dim=0) * 0.5 + 0.5
+            surf_normal   = surf_normal * 0.5 + 0.5
+            view_normal   = -F.normalize(allmap[2:5], dim=0) * 0.5 + 0.5
 
         if self.profiling_enabled:
             timer_post.__exit__(None, None, None)
             n_vis = int(is_in_box.sum()) // sparsity
             self._record_profile(n_vis, timer_sh.ms, timer_raster.ms, timer_post.ms)
+
+        if not compute_post:
+            return {"render": rendered_image}
 
         return {
             "render":      rendered_image,
@@ -368,6 +376,9 @@ class ViewerRenderer:
         }
 
     # ── output routing ────────────────────────────────────────────────────────
+
+    # Render types that only need the raw rendered image (no allmap post-processing).
+    _POST_FREE = frozenset({"render", "edge"})
 
     def get_outputs(self,
                     camera,
@@ -394,11 +405,17 @@ class ViewerRenderer:
                 return self.color_map(gradient_map(results["render"]))
             return results["render"]
 
+        if split:
+            compute_post = not (render_type1 in self._POST_FREE and render_type2 in self._POST_FREE)
+        else:
+            compute_post = render_type not in self._POST_FREE
+
         results = self.render_viewer(
             camera, active_sh_degree, scaling_modifier, depth_ratio,
             self.background_color,
             sparsity=sparsity, valid_range=valid_range,
             show_ptc=show_ptc, show_disk=show_disk, point_size=point_size,
+            compute_post=compute_post,
         )
 
         if not split:
